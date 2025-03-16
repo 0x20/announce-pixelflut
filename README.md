@@ -26,9 +26,11 @@
   - Example: `uv run pyperflut.py 192.168.5.51 1234 -l page.html`
 
 - **Animated GIF Playback**:
-  - Play animated GIFs fullscreen, matching the server’s screen size.
+  - Play animated GIFs from local files or URLs, fullscreen, matching the server’s screen size.
   - Options: Custom frame rate (`--fps`) to override GIF timing, loop indefinitely (`--loop`).
-  - Example: `uv run pyperflut.py 192.168.5.51 1234 -g animation.gif --fps 5.0 --loop`
+  - Examples:
+    - Local: `uv run pyperflut.py 192.168.5.51 1234 -g animation.gif --fps 5.0 --loop`
+    - URL: `uv run pyperflut.py 192.168.5.51 1234 -g https://example.com/animation.gif --fps 2.0`
 
 - **Screen Clearing**:
   - Clear the Pixelflut canvas with a solid color (default black).
@@ -46,4 +48,4 @@ Run with `uv run pyperflut.py <host> <port> [options]`. Use `-h` for full comman
 ## Notes
 - Screen size (e.g., 1280x720) is an example; the client queries the server’s actual size via the `SIZE` command.
 - Uses multi-threading (`--threads`) for faster pixel sending.
-- Temporary files are cleaned up automatically unless `--keep-temp` is used.
+- Temporary files are cleaned up automatically unless `--keep-temp` is used (does not apply to downloaded GIFs).

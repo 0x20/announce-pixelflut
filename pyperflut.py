@@ -14,6 +14,7 @@ import sys
 import io
 import tempfile
 import os
+import requests  # Added for GIF URL downloading
 from typing import Tuple, List, Optional
 
 # For web capture functionality
@@ -144,7 +145,7 @@ class PixelflutClient:
             raise Exception(f"Failed to capture content: {e}")
 
     def send_image(self, image_path: str, x: int = 0, y: int = 0, scale: float = 1.0, fit: bool = False):
-        """Send an image to the Pixelflut server in one shot."""
+        """Send an image to the Pixelflut server in one shot, always matching server size."""
         try:
             if not os.path.exists(image_path):
                 raise FileNotFoundError(f"Image file not found: {image_path}")
@@ -157,6 +158,14 @@ class PixelflutClient:
             img = Image.open(image_path).convert('RGBA')
             print(f"Image loaded successfully: {img.width}x{img.height}, mode: {img.mode}")
 
+            # Always resize to server size first if screen_size is known
+            if self.screen_size:
+                screen_width, screen_height = self.screen_size
+                if img.width != screen_width or img.height != screen_height:
+                    img = img.resize((screen_width, screen_height), Image.LANCZOS)
+                    print(f"Resized image to server size: {screen_width}x{screen_height}")
+
+            # Apply fit or scale only after initial resize
             if fit and self.screen_size:
                 screen_width, screen_height = self.screen_size
                 img_width, img_height = img.size
@@ -164,7 +173,7 @@ class PixelflutClient:
                 width_ratio = screen_width / img_width
                 height_ratio = screen_height / img_height
 
-                if img_height > 3 * img_width:
+                if img_height > 3 * img_width:  # Tall image adjustment
                     fit_scale = max(width_ratio, height_ratio * 0.3)
                     print(f"Adjusting scale for tall image: {fit_scale:.2f}")
                 else:
@@ -181,6 +190,7 @@ class PixelflutClient:
                 new_width = int(img.width * scale)
                 new_height = int(img.height * scale)
                 img = img.resize((new_width, new_height), Image.LANCZOS)
+                print(f"Scaled image to: {new_width}x{new_height}")
 
             width, height = img.size
             pixels = list(img.getdata())
@@ -401,69 +411,122 @@ class PixelflutClient:
                 wait_time=wait_time
             )
 
-    def send_gif(self, gif_file: str, fps: float = None, loop: bool = False):
-        """Render an animated GIF on the Pixelflut screen, fullscreen with optional looping."""
-        if not os.path.exists(gif_file):
-            raise FileNotFoundError(f"GIF file not found: {gif_file}")
-
+    def send_gif(self, gif_source: str, fps: float = None, loop: bool = False):
+        """Render an animated GIF from a file or URL on the Pixelflut screen, fullscreen with optional looping."""
         if not self.screen_size:
             raise ValueError("Screen size unknown; cannot render without server dimensions.")
 
         screen_width, screen_height = self.screen_size
-        print(f"Rendering GIF: {gif_file} on {screen_width}x{screen_height} screen, loop={loop}")
+        print(f"Rendering GIF from: {gif_source} on {screen_width}x{screen_height} screen, loop={loop}")
 
-        # Open the GIF
-        with Image.open(gif_file) as img:
-            if not img.is_animated:
-                raise ValueError(f"File {gif_file} is not an animated GIF")
+        # Handle URL or local file
+        if gif_source.startswith(('http://', 'https://')):
+            print(f"Downloading GIF from {gif_source}...")
+            response = requests.get(gif_source, timeout=10)
+            response.raise_for_status()
+            gif_data = io.BytesIO(response.content)
+            temp_gif = tempfile.NamedTemporaryFile(suffix='.gif', delete=False)
+            temp_gif.write(gif_data.read())
+            temp_gif.close()
+            gif_path = temp_gif.name
+        else:
+            if not os.path.exists(gif_source):
+                raise FileNotFoundError(f"GIF file not found: {gif_source}")
+            gif_path = gif_source
 
-            # Extract frames and durations
-            frames = []
-            durations = []
-            for frame in range(img.n_frames):
-                img.seek(frame)
-                # Convert to RGBA and resize to fullscreen
-                new_frame = Image.new("RGBA", img.size)
-                new_frame.paste(img)
-                new_frame = new_frame.resize((screen_width, screen_height), Image.LANCZOS)
-                frames.append(new_frame)
-                # Use GIF duration if FPS not specified
-                durations.append(img.info.get('duration', 100) / 1000.0)  # Convert ms to seconds
+        try:
+            # Open the GIF
+            with Image.open(gif_path) as img:
+                if not img.is_animated:
+                    raise ValueError(f"GIF from {gif_source} is not animated")
 
-            if fps is not None:
-                frame_interval = 1.0 / fps
-            else:
-                frame_interval = sum(durations) / len(durations)  # Average duration if no FPS
+                # Extract frames and durations
+                frames = []
+                durations = []
+                for frame in range(img.n_frames):
+                    img.seek(frame)
+                    # Convert to RGBA and resize to server size immediately
+                    new_frame = Image.new("RGBA", img.size)
+                    new_frame.paste(img)
+                    new_frame = new_frame.resize((screen_width, screen_height), Image.LANCZOS)
+                    frames.append(new_frame)
+                    durations.append(img.info.get('duration', 100) / 1000.0)  # Convert ms to seconds
 
-            if not self.sockets:
-                self.connect()
+                if fps is not None:
+                    frame_interval = 1.0 / fps
+                else:
+                    frame_interval = sum(durations) / len(durations)  # Average duration if no FPS
 
-            try:
-                while True:
-                    for i, frame in enumerate(frames):
-                        # Save frame to temporary file
-                        temp_frame = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
-                        temp_frame.close()
-                        frame.save(temp_frame.name, 'PNG')
+                if not self.sockets:
+                    self.connect()
 
-                        # Send frame
-                        print(f"Sending frame {i + 1}/{len(frames)}...")
-                        self.send_image(temp_frame.name, x=0, y=0, scale=1.0, fit=False)
-                        os.unlink(temp_frame.name)
+                try:
+                    while True:
+                        for i, frame in enumerate(frames):
+                            # Save frame to temporary file
+                            temp_frame = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
+                            temp_frame.close()
+                            frame.save(temp_frame.name, 'PNG')
 
-                        # Use specified FPS or GIF's frame duration
-                        time.sleep(frame_interval if fps is not None else durations[i])
+                            # Send frame, relying on send_image to enforce server size
+                            print(f"Sending frame {i + 1}/{len(frames)}...")
+                            self.send_image(temp_frame.name, x=0, y=0, scale=1, fit=False)
+                            os.unlink(temp_frame.name)
 
-                    if not loop:
-                        break
-                    print("Looping GIF...")
+                            # Throttle between frames
+                            time.sleep(max(frame_interval, 0.1))  # Minimum 0.1s delay
 
-                print("GIF playback completed")
+                        if not loop:
+                            break
+                        print("Looping GIF...")
+                        time.sleep(0.5)  # Delay between loops
 
-            except Exception as e:
-                print(f"Error in GIF playback: {e}")
-            finally:
-                self.close()
+                    print("GIF playback completed")
+
+                except Exception as e:
+                    print(f"Error in GIF playback: {e}")
+                finally:
+                    self.close()
+
+        finally:
+            if gif_source.startswith(('http://', 'https://')):
+                os.unlink(gif_path)  # Clean up downloaded GIF
+
+    def _send_pixels(self, thread_id: int, pixels: List[Tuple[int, int, Tuple[int, int, int]]], offset_x: int, offset_y: int, img_width: int):
+        """Send a batch of pixels using a single thread and socket with throttling."""
+        if not pixels:
+            return
+
+        try:
+            sock = self.sockets[thread_id]
+            commands = []
+            for px, py, color in pixels:
+                x, y = px + offset_x, py + offset_y
+                r, g, b = color
+                cmd = f"PX {x} {y} {r:02x}{g:02x}{b:02x}\n"
+                commands.append(cmd)
+
+            batch_size = 500  # Reduced from 100 to lower server load
+            for i in range(0, len(commands), batch_size):
+                try:
+                    batch = commands[i:i+batch_size]
+                    sock.sendall(''.join(batch).encode())
+                    time.sleep(0.02)  # Increased delay to 20ms per batch
+                except (ConnectionResetError, BrokenPipeError) as e:
+                    print(f"Thread {thread_id} reconnecting after error: {e}")
+                    try:
+                        sock.close()
+                    except:
+                        pass
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.connect((self.host, self.port))
+                    self.sockets[thread_id] = sock
+                    sock.sendall(''.join(batch).encode())
+                    time.sleep(0.2)  # Increased delay after reconnect
+
+        except Exception as e:
+            print(f"Thread {thread_id} error: {e}")
+
 
     def _distribute_pixels(self, width: int, height: int, pixels: List[Tuple[int, int, int, int]]) -> List[List[Tuple[int, int, Tuple[int, int, int]]]]:
         """Distribute pixels among threads for efficient sending."""
@@ -483,42 +546,6 @@ class PixelflutClient:
                     buckets[bucket_idx].append((x, y, rgb))
 
         return buckets
-
-    def _send_pixels(self, thread_id: int, pixels: List[Tuple[int, int, Tuple[int, int, int]]], offset_x: int, offset_y: int, img_width: int):
-        """Send a batch of pixels using a single thread and socket."""
-        if not pixels:
-            return
-
-        try:
-            sock = self.sockets[thread_id]
-            commands = []
-            for px, py, color in pixels:
-                x, y = px + offset_x, py + offset_y
-                r, g, b = color
-                cmd = f"PX {x} {y} {r:02x}{g:02x}{b:02x}\n"
-                commands.append(cmd)
-
-            batch_size = 100
-            for i in range(0, len(commands), batch_size):
-                try:
-                    batch = commands[i:i+batch_size]
-                    sock.sendall(''.join(batch).encode())
-                    if i % 1000 == 0:
-                        time.sleep(0.01)
-                except (ConnectionResetError, BrokenPipeError) as e:
-                    print(f"Thread {thread_id} reconnecting after error: {e}")
-                    try:
-                        sock.close()
-                    except:
-                        pass
-                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    sock.connect((self.host, self.port))
-                    self.sockets[thread_id] = sock
-                    sock.sendall(''.join(batch).encode())
-                    time.sleep(0.1)
-
-        except Exception as e:
-            print(f"Thread {thread_id} error: {e}")
 
     def clear_screen(self, color: Tuple[int, int, int] = (0, 0, 0)):
         """Clear the screen with a solid color."""
@@ -586,7 +613,7 @@ def main():
     source_group.add_argument('-u', '--url', help='Website URL to capture and send')
     source_group.add_argument('-m', '--markdown', help='Markdown file to render and send')
     source_group.add_argument('-l', '--html', help='HTML file to render and send')
-    source_group.add_argument('-g', '--gif', help='Animated GIF file to render')
+    source_group.add_argument('-g', '--gif', help='Animated GIF file or URL to render')
 
     web_group = parser.add_argument_group('Web capture options')
     web_group.add_argument('--width', type=int, default=1280, help='Browser window width (default: 1280)')
