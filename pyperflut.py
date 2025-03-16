@@ -230,51 +230,49 @@ class PixelflutClient:
 
         service = Service(ChromeDriverManager().install())
         driver = webdriver.Chrome(service=service, options=chrome_options)
-        driver.get(url)
-
-        time.sleep(wait_time)
-
-        total_height = driver.execute_script("return Math.max( document.body.scrollHeight, document.body.offsetHeight, document.documentElement.clientHeight, document.documentElement.scrollHeight, document.documentElement.offsetHeight );")
-        print(f"Total content height: {total_height}px")
 
         if not self.sockets:
             self.connect()
 
-        scroll_step = screen_height  # Move by full screen height
-        current_y = 0
-        cycle_count = 0
-
         try:
+            cycle_count = 0
             while cycle_count < cycles:
-                print(f"Cycle {cycle_count + 1}/{cycles}, scrolling to y={current_y}")
+                print(f"Cycle {cycle_count + 1}/{cycles}: Loading fresh content from {url}")
+                driver.get(url)  # Refresh the page at the start of each cycle
+                time.sleep(wait_time)
 
-                driver.execute_script(f"window.scrollTo(0, {current_y});")
-                time.sleep(0.5)  # Wait for scroll to settle
+                total_height = driver.execute_script("return Math.max( document.body.scrollHeight, document.body.offsetHeight, document.documentElement.clientHeight, document.documentElement.scrollHeight, document.documentElement.offsetHeight );")
+                print(f"Total content height: {total_height}px")
 
-                temp_file = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
-                temp_file.close()
-                screenshot_path = temp_file.name
+                scroll_step = screen_height  # Move by full screen height
+                current_y = 0
 
-                driver.save_screenshot(screenshot_path)
+                while current_y < total_height:
+                    print(f"Cycle {cycle_count + 1}/{cycles}, scrolling to y={current_y}")
+                    driver.execute_script(f"window.scrollTo(0, {current_y});")
+                    time.sleep(0.5)  # Wait for scroll to settle
 
-                # Ensure dimensions match canvas
-                with Image.open(screenshot_path) as img:
-                    if img.size != (screen_width, screen_height):
-                        img = img.resize((screen_width, screen_height), Image.LANCZOS)
-                        img.save(screenshot_path)
+                    temp_file = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
+                    temp_file.close()
+                    screenshot_path = temp_file.name
 
-                self.send_image(screenshot_path, x=0, y=0, scale=1.0, fit=False)
-                os.unlink(screenshot_path)
+                    driver.save_screenshot(screenshot_path)
 
-                # Increment scroll position
-                current_y += scroll_step
-                if current_y >= total_height:
-                    current_y = 0  # Reset to top
-                    cycle_count += 1
-                    if cycle_count < cycles:
-                        print(f"Completed cycle {cycle_count}, starting next cycle")
+                    # Ensure dimensions match canvas
+                    with Image.open(screenshot_path) as img:
+                        if img.size != (screen_width, screen_height):
+                            img = img.resize((screen_width, screen_height), Image.LANCZOS)
+                            img.save(screenshot_path)
 
-                time.sleep(scroll_interval)
+                    self.send_image(screenshot_path, x=0, y=0, scale=1.0, fit=False)
+                    os.unlink(screenshot_path)
+
+                    current_y += scroll_step
+                    time.sleep(scroll_interval)
+
+                cycle_count += 1
+                if cycle_count < cycles:
+                    print(f"Completed cycle {cycle_count}, refreshing for next cycle")
 
             print(f"Completed {cycles} cycles, stopping execution")
 
@@ -403,6 +401,70 @@ class PixelflutClient:
                 wait_time=wait_time
             )
 
+    def send_gif(self, gif_file: str, fps: float = None, loop: bool = False):
+        """Render an animated GIF on the Pixelflut screen, fullscreen with optional looping."""
+        if not os.path.exists(gif_file):
+            raise FileNotFoundError(f"GIF file not found: {gif_file}")
+
+        if not self.screen_size:
+            raise ValueError("Screen size unknown; cannot render without server dimensions.")
+
+        screen_width, screen_height = self.screen_size
+        print(f"Rendering GIF: {gif_file} on {screen_width}x{screen_height} screen, loop={loop}")
+
+        # Open the GIF
+        with Image.open(gif_file) as img:
+            if not img.is_animated:
+                raise ValueError(f"File {gif_file} is not an animated GIF")
+
+            # Extract frames and durations
+            frames = []
+            durations = []
+            for frame in range(img.n_frames):
+                img.seek(frame)
+                # Convert to RGBA and resize to fullscreen
+                new_frame = Image.new("RGBA", img.size)
+                new_frame.paste(img)
+                new_frame = new_frame.resize((screen_width, screen_height), Image.LANCZOS)
+                frames.append(new_frame)
+                # Use GIF duration if FPS not specified
+                durations.append(img.info.get('duration', 100) / 1000.0)  # Convert ms to seconds
+
+            if fps is not None:
+                frame_interval = 1.0 / fps
+            else:
+                frame_interval = sum(durations) / len(durations)  # Average duration if no FPS
+
+            if not self.sockets:
+                self.connect()
+
+            try:
+                while True:
+                    for i, frame in enumerate(frames):
+                        # Save frame to temporary file
+                        temp_frame = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
+                        temp_frame.close()
+                        frame.save(temp_frame.name, 'PNG')
+
+                        # Send frame
+                        print(f"Sending frame {i + 1}/{len(frames)}...")
+                        self.send_image(temp_frame.name, x=0, y=0, scale=1.0, fit=False)
+                        os.unlink(temp_frame.name)
+
+                        # Use specified FPS or GIF's frame duration
+                        time.sleep(frame_interval if fps is not None else durations[i])
+
+                    if not loop:
+                        break
+                    print("Looping GIF...")
+
+                print("GIF playback completed")
+
+            except Exception as e:
+                print(f"Error in GIF playback: {e}")
+            finally:
+                self.close()
+
     def _distribute_pixels(self, width: int, height: int, pixels: List[Tuple[int, int, int, int]]) -> List[List[Tuple[int, int, Tuple[int, int, int]]]]:
         """Distribute pixels among threads for efficient sending."""
         buckets = [[] for _ in range(self.threads)]
@@ -524,12 +586,13 @@ def main():
     source_group.add_argument('-u', '--url', help='Website URL to capture and send')
     source_group.add_argument('-m', '--markdown', help='Markdown file to render and send')
     source_group.add_argument('-l', '--html', help='HTML file to render and send')
+    source_group.add_argument('-g', '--gif', help='Animated GIF file to render')
 
     web_group = parser.add_argument_group('Web capture options')
     web_group.add_argument('--width', type=int, default=1280, help='Browser window width (default: 1280)')
     web_group.add_argument('--height', type=int, default=720, help='Browser window height (default: 720)')
     web_group.add_argument('--wait', type=int, default=3, help='Wait time for page loading in seconds (default: 3)')
-    web_group.add_argument('--keep-temp', action='store_true', help='Keep temporary screenshot file (non-Markdown/HTML only)')
+    web_group.add_argument('--keep-temp', action='store_true', help='Keep temporary screenshot file (non-Markdown/HTML/GIF only)')
     web_group.add_argument('--full-page', action='store_true', help='Capture full page height (non-scrolling mode only)')
     web_group.add_argument('--capture-height', type=int, help='Specify custom capture height in pixels')
     web_group.add_argument('--max-height', type=int, default=3000, help='Maximum capture height in pixels (default: 3000)')
@@ -538,10 +601,12 @@ def main():
     parser.add_argument('-y', type=int, default=0, help='Y position (default: 0)')
     parser.add_argument('-s', '--scale', type=float, default=1.0, help='Scale factor (default: 1.0)')
     parser.add_argument('-f', '--fit', action='store_true', help='Fit image to screen (scale and center)')
-    parser.add_argument('-t', '--threads', type=int, default=4, help='Number of threads to use (default: 4)')  # Note: -t reused, but mutually exclusive
+    parser.add_argument('-t', '--threads', type=int, default=4, help='Number of threads to use (default: 4)')
     parser.add_argument('-c', '--clear', action='store_true', help='Clear screen before sending')
     parser.add_argument('--scroll', type=float, help='Enable scrolling mode with interval in seconds (e.g., 5.0)')
     parser.add_argument('--cycles', type=int, default=1, help='Number of full scroll cycles (default: 1)')
+    parser.add_argument('--fps', type=float, help='Frames per second for GIF playback (overrides GIF timing)')
+    parser.add_argument('--loop', action='store_true', help='Loop GIF playback indefinitely')
 
     args = parser.parse_args()
 
@@ -575,17 +640,23 @@ def main():
                 cycles=args.cycles,
                 wait_time=args.wait
             )
+        elif args.gif:
+            client.send_gif(
+                args.gif,
+                fps=args.fps,
+                loop=args.loop
+            )
         else:
             image_path = args.image
 
-        if not args.scroll and not args.markdown and not args.html and not args.url:
+        if not args.scroll and not args.markdown and not args.html and not args.url and not args.gif:
             if not os.path.exists(image_path):
                 print(f"Error: Image file not found: {image_path}")
                 sys.exit(1)
             client.send_image(image_path, args.x, args.y, args.scale, args.fit)
 
     finally:
-        if not args.scroll and not args.markdown and not args.html and not args.url:  # Scrolling/Markdown/HTML handle their own cleanup
+        if not args.scroll and not args.markdown and not args.html and not args.url and not args.gif:  # Scrolling/Markdown/HTML/GIF handle their own cleanup
             client.close()
             if temp_file and os.path.exists(temp_file) and not args.keep_temp:
                 try:
